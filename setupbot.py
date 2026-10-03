@@ -20,6 +20,7 @@ import sys
 import time
 import base64
 import json
+import signal
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -27,6 +28,39 @@ BOT_CODE_B64 = b"IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKVGVsZWdyYW0gcmVtb3RlLWNvbnR
 
 def is_termux():
     return "com.termux" in os.environ.get("PREFIX", "") or os.path.exists("/data/data/com.termux")
+
+def _kill_by_cmdline(pattern, wait=3.0):
+    """pkill replacement that needs NO procps (python:*-slim images do not ship pkill/ps).
+    Stops every other process whose command line contains `pattern`. Returns list of PIDs."""
+    if IS_WINDOWS or not os.path.isdir("/proc"):
+        os.system(f"pkill -f '{pattern}' 2>/dev/null || true")
+        return []
+    me, found = {os.getpid(), os.getppid()}, []
+    for d in os.listdir("/proc"):
+        if not d.isdigit() or int(d) in me:
+            continue
+        try:
+            with open(f"/proc/{d}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").decode("utf-8", "ignore")
+        except Exception:
+            continue
+        if pattern in cmd:
+            found.append(int(d))
+    for pid in found:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    end = time.time() + wait
+    while time.time() < end and any(os.path.exists(f"/proc/{p}") for p in found):
+        time.sleep(0.1)
+    for pid in found:                     # anything still alive -> SIGKILL
+        if os.path.exists(f"/proc/{pid}"):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+    return found
 
 def is_container():
     return os.path.exists("/.dockerenv") or os.environ.get("CONTAINER") or os.environ.get("RENDER") or os.environ.get("RAILWAY_STATIC_URL")
@@ -462,8 +496,11 @@ export BROWSER="/bin/true"
     with open(u_file, "w") as f:
         json.dump(all_u, f, indent=2)
 
-    # Kill any old bot process
-    os.system("pkill -f 'telegram_bot.py' 2>/dev/null || true")
+    # Kill any old bot process. First the old start.sh watchdog (else it respawns the bot), then the bot itself.
+    # Pure-Python (no pkill): slim Docker images / Hugging Face Spaces do not have it.
+    old = _kill_by_cmdline("agy_bot/start.sh") + _kill_by_cmdline("telegram_bot.py")
+    if old:
+        print(f"Stopped old bot process(es): {old}")
     time.sleep(1)
 
     # Execution mode
